@@ -76,7 +76,7 @@ def clean_args(args, source_file=None, directory=None):
 
 def _load_compile_db():
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    db_path = os.path.join(script_dir, "..", "buildCustom", "compile_commands.json")
+    db_path = os.path.join(script_dir, "..", "buildX", "compile_commands.json")
     with open(db_path) as f:
         return json.load(f)
 
