@@ -30,6 +30,12 @@ DEFAULT_COLLECTION = "cpp_callgraph"
 DEFAULT_DB_DIR = "./chroma_db"
 
 
+def connect_collection(db_dir, collection_name):
+    client = chromadb.PersistentClient(path=db_dir)
+    collection = client.get_or_create_collection(name=collection_name)
+    return client, collection
+
+
 def load_callgraph(path):
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
@@ -167,6 +173,30 @@ def run_query(collection, model_name, query_text, top_k):
             print(f"    {line_text}")
 
 
+def validate_db(db_dir, collection_name, model_name=None, query_text=None, top_k=5):
+    client, collection = connect_collection(db_dir, collection_name)
+
+    collections = [c.name for c in client.list_collections()]
+    print("DB health report:")
+    print(f"  db_dir: {os.path.abspath(db_dir)}")
+    print(f"  collections: {collections}")
+    print(f"  active collection: {collection_name}")
+
+    count = collection.count()
+    print(f"  vector count: {count}")
+
+    sample = collection.peek(limit=min(5, max(1, count))) if count > 0 else {"ids": []}
+    print(f"  sample ids: {sample.get('ids', [])}")
+
+    if query_text:
+        if not model_name:
+            raise ValueError("model_name is required when running a semantic query")
+        print("\nRunning semantic query as part of validation...")
+        run_query(collection, model_name, query_text, top_k)
+
+    return count
+
+
 def main():
     parser = argparse.ArgumentParser(description="Embed callgraph nodes into Chroma")
     parser.add_argument("--callgraph", default="callgraph.json", help="Path to callgraph JSON")
@@ -177,8 +207,23 @@ def main():
 
     parser.add_argument("--query", default=None, help="Optional semantic query after indexing")
     parser.add_argument("--top-k", type=int, default=5, help="Top K query results")
+    parser.add_argument(
+        "--validate-db",
+        action="store_true",
+        help="Validate existing DB and exit (no indexing)",
+    )
 
     args = parser.parse_args()
+
+    if args.validate_db:
+        validate_db(
+            db_dir=args.db_dir,
+            collection_name=args.collection,
+            model_name=args.model,
+            query_text=args.query,
+            top_k=args.top_k,
+        )
+        return
 
     callgraph_abs = os.path.abspath(args.callgraph)
     if not os.path.exists(callgraph_abs):
