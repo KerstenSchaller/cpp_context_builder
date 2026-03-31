@@ -1,4 +1,6 @@
 callgraph.json
+chroma_db/
+eval_queries.example.json
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
