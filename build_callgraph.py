@@ -149,36 +149,67 @@ def extract_callgraph(tu, source_file_abs):
     """
     Walk the translation unit and return (nodes, edges) for *source_file_abs*.
 
-    nodes: list of dicts  { id, file, line }
+    nodes: list of dicts  { id, file, line, type }
     edges: list of dicts  { caller, callee }
     """
     nodes = []
     edges = []
-    seen_callers = set()
+    seen_node_ids = set()
+
+    # Kinds for classes, structs, enums
+    CLASS_KINDS = {CursorKind.CLASS_DECL, CursorKind.STRUCT_DECL}
+    ENUM_KINDS = {CursorKind.ENUM_DECL}
 
     def walk(cursor):
         kind = _kind_safe(cursor)
         if kind is None:
             return
 
+        loc = cursor.location
+
+
+        # Functions/methods (with call edges)
         if kind in DEFINITION_KINDS and cursor.is_definition():
-            loc = cursor.location
-            # Only process cursors that live in the file being parsed
-            # (avoids pulling in every included header)
-            if loc.file and os.path.abspath(loc.file.name) == source_file_abs:
-                caller_id = qualified_name(cursor)
-                if caller_id and caller_id not in seen_callers:
-                    seen_callers.add(caller_id)
-                    rel_path = os.path.relpath(loc.file.name)
-                    nodes.append({
-                        "id":   caller_id,
-                        "file": rel_path.replace("\\", "/"),
-                        "line": loc.line,
-                    })
-                    calls = set()
-                    _collect_calls(cursor, source_file_abs, calls)
-                    for callee_id in sorted(calls):
-                        edges.append({"caller": caller_id, "callee": callee_id})
+            node_id = qualified_name(cursor)
+            if node_id and node_id not in seen_node_ids:
+                seen_node_ids.add(node_id)
+                rel_path = os.path.relpath(loc.file.name)
+                nodes.append({
+                    "id":   node_id,
+                    "file": rel_path.replace("\\", "/"),
+                    "line": loc.line,
+                    "type": "function"
+                })
+                calls = set()
+                _collect_calls(cursor, source_file_abs, calls)
+                for callee_id in sorted(calls):
+                    edges.append({"caller": node_id, "callee": callee_id})
+
+        # Classes/structs (no edges)
+        elif kind in CLASS_KINDS and cursor.is_definition():
+            node_id = qualified_name(cursor)
+            if node_id and node_id not in seen_node_ids:
+                seen_node_ids.add(node_id)
+                rel_path = os.path.relpath(loc.file.name)
+                nodes.append({
+                    "id":   node_id,
+                    "file": rel_path.replace("\\", "/"),
+                    "line": loc.line,
+                    "type": "class" if kind == CursorKind.CLASS_DECL else "struct"
+                })
+
+        # Enums (no edges)
+        elif kind in ENUM_KINDS and cursor.is_definition():
+            node_id = qualified_name(cursor)
+            if node_id and node_id not in seen_node_ids:
+                seen_node_ids.add(node_id)
+                rel_path = os.path.relpath(loc.file.name)
+                nodes.append({
+                    "id":   node_id,
+                    "file": rel_path.replace("\\", "/"),
+                    "line": loc.line,
+                    "type": "enum"
+                })
 
         for child in cursor.get_children():
             walk(child)
