@@ -44,15 +44,6 @@ def getFields(cursor):
             fields.append(f"{child.type.spelling} {child.spelling}")
     return fields
 
-def getMethods(cursor):
-    """Get the methods of a class/struct cursor"""
-    methods = []
-    for child in cursor.get_children():
-        if child.kind in DEFINITION_KINDS:
-            methodStr = f"{child.type.spelling} "
-            methodStr = methodStr.replace(" ", f" {child.spelling}", 1)
-            methods.append(f"{methodStr}")
-    return methods
 
 def getNamespaces(cursor):
     """Get the namespaces of a cursor"""
@@ -63,6 +54,18 @@ def getNamespaces(cursor):
             namespaces.append(parent.spelling)
         parent = parent.semantic_parent
     return '::'.join(reversed(namespaces))
+
+
+
+def getMethods(cursor):
+    """Get the methods of a class/struct cursor"""
+    methods = []
+    for child in cursor.get_children():
+        if child.kind in DEFINITION_KINDS:
+            methodStr = f"{child.type.spelling} "
+            methodStr = methodStr.replace(" ", f" {child.spelling}", 1)
+            methods.append(f"{methodStr}")
+    return methods
 
 def parseClass(cursor):
     """Parse a class/struct declaration and print its fields"""
@@ -76,6 +79,77 @@ def parseClass(cursor):
         "name": cursor.spelling,
         "fields": getFields(cursor),
         "methods": getMethods(cursor),
+        "source": getSource(cursor)
+    }
+
+def parseEnum(cursor):
+    """Parse an enum declaration and return its info as a dict."""
+    enum_constants = []
+    for child in cursor.get_children():
+        if child.kind == CursorKind.ENUM_CONSTANT_DECL:
+            enum_constants.append(child.spelling + (f" = {child.enum_value}" if child.enum_value is not None else ""))
+    return {
+        "type": "enum",
+        "comment": "Implementation info of an enum",
+        "location": f"{cursor.location.file}:{cursor.location.line}" if cursor.location.file else "unknown",
+        "namespaces": getNamespaces(cursor),
+        "name": cursor.spelling,
+        "constants": enum_constants,
+        "source": getSource(cursor)
+    }
+
+def getFunctionCallNamespaces(cursor, isConstructorCall):
+    """Get the namespaces of a function call cursor"""
+    # regular functions
+    recurse = (lambda self, cur: sum([
+        [child.spelling] if child.kind == CursorKind.NAMESPACE_REF else self(self, child)
+        for child in cur.get_children()
+    ], []))
+    namespaces = recurse(recurse, cursor)
+    # class member functions have a child MEMBER_REF_EXPR which has a child DECL_REF_EXPR
+    if namespaces == []:
+        for child in cursor.get_children():
+            if child.kind == CursorKind.MEMBER_REF_EXPR:
+                for grandchild in child.get_children():
+                    if grandchild.kind == CursorKind.DECL_REF_EXPR:
+                        namespaces.append(grandchild.type.spelling)
+    # constructor calls are TYPE_REF followed by CALL_EXPR
+    if namespaces == []:
+        if isConstructorCall:
+            namespaces.append(cursor.type.spelling)
+    return '::'.join(reversed(namespaces))    
+
+
+
+def getFunctionCalls(cursor):
+    """Get the function calls made within a function/method cursor."""
+    calls = []
+    children = list(cursor.get_children())
+    for i in range(len(children)):
+        child = children[i]
+        if child.kind == CursorKind.CALL_EXPR:
+            called_func = child.displayname.split('(')[0]  # Get function name without arguments
+            if children[i - 1].kind == CursorKind.TYPE_REF:
+                namespaces = getFunctionCallNamespaces(child, True)
+            else:
+                namespaces = getFunctionCallNamespaces(child, False)
+            if namespaces != "":
+                called_func = f"{namespaces}::{called_func}"
+            calls.append(called_func)
+        calls.extend(getFunctionCalls(child))  # Recurse into children
+    return calls
+
+def parseFunction(cursor):
+    """Parse a function/method declaration and return its info as a dict."""
+    return {
+        "type": "function",
+        "comment": "Implementation info of a function",
+        "location": f"{cursor.location.file}:{cursor.location.line}" if cursor.location.file else "unknown",
+        "namespaces": getNamespaces(cursor),
+        "name": cursor.spelling,
+        "return_type": cursor.result_type.spelling if hasattr(cursor, 'result_type') else None,
+        "arguments": [f"{arg.type.spelling} {arg.spelling}" for arg in cursor.get_arguments()] if hasattr(cursor, 'get_arguments') else [],
+        "calls": getFunctionCalls(cursor),
         "source": getSource(cursor)
     }
 
@@ -99,17 +173,28 @@ def handle_class(cursor):
     classInfo = parseClass(cursor)
     printDictRecursively(classInfo)
     
-  
+def handle_enum(cursor):
+    enumInfo = parseEnum(cursor)
+    printDictRecursively(enumInfo)
+
+def handle_function(cursor):
+    functionInfo = parseFunction(cursor)
+    printDictRecursively(functionInfo)
+
+
 
 
 
 def walk_ast(cursor):
     for child in cursor.get_children():
-        match child.kind:
-            case CursorKind.CLASS_DECL | CursorKind.STRUCT_DECL:
-                handle_class(child)
-            case _:
-                walk_ast(child)
+        if child.kind in CLASS_KINDS:
+            handle_class(child)
+        elif child.kind in ENUM_KINDS:
+            handle_enum(child)
+        elif child.kind in DEFINITION_KINDS:
+            handle_function(child)
+        
+        walk_ast(child)
 
 # === Parse a C/C++ file ===
 index = Index.create()
