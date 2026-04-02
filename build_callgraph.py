@@ -41,6 +41,10 @@ import shlex
 import argparse
 from clang.cindex import Index, CursorKind, Config, TranslationUnit
 
+def logToFile(message, path = "build_callgraph.log"):
+    with open(path, "a") as log_file:
+        log_file.write(message + "\n")
+
 # ── libclang library path ────────────────────────────────────────────────────
 Config.set_library_file("/usr/lib/llvm-14/lib/libclang.so")
 
@@ -50,6 +54,7 @@ SKIP_WITH_VALUE = {"-o", "-MF", "-MT", "-MQ", "-MJ"}
 SKIP_PREFIXES   = ["-Wl,", "-Winvalid", "-Werror", "-O"]
 SKIP_EXACT      = {"-c"}
 
+unhandledKinds = set()
 
 def clean_args(args, source_file=None, directory=None):
     filtered = []
@@ -211,6 +216,15 @@ def extract_callgraph(tu, source_file_abs):
                     "type": "enum"
                 })
 
+        else:
+            # save kind to var unhandledKinds and log them to 
+            # a file when a new one is enountered, to help us iteratively expand the graph types we track
+            if kind not in unhandledKinds:
+                excludedPaths = {"x86_64-linux-gnu/","clang","fmt-src"}
+                if not any(part in str(loc.file) for part in excludedPaths):
+                    unhandledKinds.add(kind)
+                    logToFile(f"Unhandled cursor kind: {kind} ({kind.name}) at {loc.file}:{loc.line}", path="unHandledKinds.log")
+
         for child in cursor.get_children():
             walk(child)
 
@@ -220,12 +234,49 @@ def extract_callgraph(tu, source_file_abs):
 
 # ── parsing ──────────────────────────────────────────────────────────────────
 
+
+
 _index = Index.create()
+
+def rewrite_includes(file_path):
+    with open(file_path) as f:
+        content = f.read()
+
+    # content = content.replace('#include "df/', '#include "')
+
+    tmp_path = file_path + ".tmp.cpp"
+    with open(tmp_path, "w") as f:
+        f.write(content)
+
+    return tmp_path
+
+filter_strings = [
+		'depends',
+        'usr/include',
+        'include/c++',
+        '_deps',
+        'x86_64-linux-gnu',
+        'fmt-src'
+]
+
 
 
 def parse_file(file_path, compile_args):
+    print(f"parsing file: {file_path}")
+    #for s in filter_strings:
+        #if s in file_path:
+        #print(f"  ⚠️  Skipping {file_path} (matches filter)")
+        #return [], []
+
+
+
+    
     file_path = os.path.abspath(file_path)
-    extra = ["-fparse-all-comments", "-xc++"]
+    extra_includes = [
+        "",
+    ]
+
+    extra = ["-fparse-all-comments", "-xc++"] + extra_includes
     args = compile_args + extra
     try:
         tu = _index.parse(
@@ -234,7 +285,7 @@ def parse_file(file_path, compile_args):
             options=TranslationUnit.PARSE_INCOMPLETE,
         )
     except Exception as e:
-        print(f"  ⚠️  Parse failed ({e}), retrying with minimal args…")
+        print(f"   Parse failed ({e}), retrying with minimal args…")
         tu = _index.parse(
             file_path,
             args=["-std=c++20", "-xc++"],
@@ -244,6 +295,9 @@ def parse_file(file_path, compile_args):
     fatal = [d for d in tu.diagnostics if d.severity >= 3]
     if fatal:
         print(f"  ⚠️  {len(fatal)} fatal diagnostic(s) in {os.path.basename(file_path)}")
+        print("    " + "\n    ".join(str(d) for d in fatal))
+        logToFile(f"Fatal diagnostics in {file_path}:\n" + "\n".join(str(d) for d in fatal))
+
 
     return extract_callgraph(tu, os.path.abspath(file_path))
 

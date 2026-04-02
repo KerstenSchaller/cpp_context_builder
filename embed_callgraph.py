@@ -15,7 +15,7 @@ Index modes:
     - hybrid: both graph + source documents (best for retrieval quality)
 
 Usage:
-    python embed_callgraph.py --callgraph callgraph.json --index-mode hybrid
+    python3 embed_callgraph.py --callgraph callgraph.json --index-mode hybrid
 
 Optional query:
     python embed_callgraph.py --callgraph callgraph.json --query "magma flow" --top-k 5
@@ -26,14 +26,18 @@ import json
 import os
 from collections import defaultdict
 
+
 import chromadb
 from sentence_transformers import SentenceTransformer
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 DEFAULT_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 DEFAULT_COLLECTION = "cpp_callgraph"
 DEFAULT_DB_DIR = "./chroma_db"
 MAX_SOURCE_LINES = 1200
+
+debug = True
 
 
 def connect_collection(db_dir, collection_name):
@@ -69,13 +73,16 @@ def make_doc(node, calls_map, called_by_map):
     node_id = node.get("id", "")
     file_path = node.get("file", "")
     line = node.get("line", 0)
+    node_type = node.get("type", "function")
+
+    type_label = node_type.capitalize() if node_type else "Function"
 
     callees = sorted(set(calls_map.get(node_id, [])))
     callers = sorted(set(called_by_map.get(node_id, [])))
 
     # A retrieval-friendly text view that preserves both local and graph context.
     lines = [
-        f"Function: {node_id}",
+        f"{type_label}: {node_id}",
         f"Location: {file_path}:{line}",
         f"Calls count: {len(callees)}",
         f"Called-by count: {len(callers)}",
@@ -171,24 +178,82 @@ def extract_function_source_text(file_path, start_line, max_lines=MAX_SOURCE_LIN
     return "".join(lines[start_idx:end_idx]).strip()
 
 
+def extract_struct_source_text(file_path, start_line, max_lines=MAX_SOURCE_LINES):
+    """
+    Extracts a struct or class definition starting at start_line.
+    Looks for opening '{' and ending '};'.
+    """
+    if not file_path or not os.path.exists(file_path):
+        return None
+
+    with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+        lines = f.readlines()
+
+    if not lines:
+        return None
+
+    start_idx = max(0, int(start_line) - 1)
+    start_idx = min(start_idx, len(lines) - 1)
+
+    opened = False
+    depth = 0
+    end_idx = min(len(lines), start_idx + max_lines)
+    for i in range(start_idx, end_idx):
+        line = lines[i]
+        if '{' in line:
+            opened = True
+            depth += line.count('{')
+        if opened:
+            depth += line.count('{') - line.count('}')
+            if depth <= 0 and '};' in line:
+                return "".join(lines[start_idx:i+1]).strip()
+    # fallback: try to find closing '};' if not found by depth
+    for i in range(start_idx, end_idx):
+        if '};' in lines[i]:
+            return "".join(lines[start_idx:i+1]).strip()
+    return "".join(lines[start_idx:end_idx]).strip()
+
+
 def make_source_doc(node, source_root):
     node_id = node.get("id", "")
     file_hint = str(node.get("file", ""))
     line = int(node.get("line", 0))
+    node_type = node.get("type", "function")
+    type_label = node_type.capitalize() if node_type else "Function"
 
     src_path = resolve_source_path(file_hint, source_root)
-    snippet = extract_function_source_text(src_path, line) if src_path else None
+    snippet = None
+    # Dispatch extraction based on node_type
+    if src_path:
+        if node_type == "function":
+            snippet = extract_function_source_text(src_path, line)
+        elif node_type == "struct":
+            snippet = extract_struct_source_text(src_path, line)
+        else:
+            # fallback to function extraction for unknown types
+            snippet = extract_function_source_text(src_path, line)
+
+    if debug:
+        if node_type == "struct":
+            # save snippet to a file for debugging
+            debug_dir = "debug_snippets"
+            os.makedirs(debug_dir, exist_ok=True)
+            debug_path = os.path.join(debug_dir, f"{node_id.replace('::', '_').replace('<', '_').replace('>', '_').replace('(', '_').replace(')', '_')}.txt")
+            with open(debug_path, "w", encoding="utf-8") as debug_file:
+                debug_file.write(f"Source path: {src_path}\n")
+                debug_file.write(f"Extracted snippet:\n{snippet}\n")
+
 
     if snippet:
         text = (
-            f"Function: {node_id}\n"
+            f"{type_label}: {node_id}\n"
             f"Location: {file_hint}:{line}\n"
             f"Source:\n{snippet}"
         )
         return text, True
 
     text = (
-        f"Function: {node_id}\n"
+        f"{type_label}: {node_id}\n"
         f"Location: {file_hint}:{line}\n"
         "Source: <unavailable>"
     )
@@ -202,47 +267,63 @@ def build_index_records(nodes, edges, index_mode, source_root):
     docs = []
     metadatas = []
 
-    for node in nodes:
+    def process_node(node):
         node_id = node.get("id")
         if not node_id:
-            continue
-
+            return []
         file_path = str(node.get("file", ""))
+
+        filter_strings = [
+            'depends',
+            'usr/include',
+            'include/c++',
+            '_deps',
+            'x86_64-linux-gnu',
+            'fmt-src'
+        ]
+
+        if any(s in file_path for s in filter_strings):
+            return []
+
         line = int(node.get("line", 0))
-
+        node_type = node.get("type", "function")
         graph_doc, callees, callers = make_doc(node, calls_map, called_by_map)
-
+        results = []
         if index_mode in ("graph", "hybrid"):
             graph_id = node_id if index_mode == "graph" else f"{node_id}::graph"
-            ids.append(graph_id)
-            docs.append(graph_doc)
-            metadatas.append(
-                {
-                    "symbol": node_id,
-                    "file": file_path,
-                    "line": line,
-                    "view": "graph",
-                    "num_calls": len(callees),
-                    "num_called_by": len(callers),
-                }
-            )
-
+            results.append((graph_id, graph_doc, {
+                "symbol": node_id,
+                "file": file_path,
+                "line": line,
+                "type": node_type,
+                "view": "graph",
+                "num_calls": len(callees),
+                "num_called_by": len(callers),
+            }))
         if index_mode in ("source", "hybrid"):
             source_doc, has_source = make_source_doc(node, source_root)
             source_id = node_id if index_mode == "source" else f"{node_id}::source"
-            ids.append(source_id)
-            docs.append(source_doc)
-            metadatas.append(
-                {
-                    "symbol": node_id,
-                    "file": file_path,
-                    "line": line,
-                    "view": "source",
-                    "num_calls": len(callees),
-                    "num_called_by": len(callers),
-                    "has_source": 1 if has_source else 0,
-                }
-            )
+            results.append((source_id, source_doc, {
+                "symbol": node_id,
+                "file": file_path,
+                "line": line,
+                "type": node_type,
+                "view": "source",
+                "num_calls": len(callees),
+                "num_called_by": len(callers),
+                "has_source": 1 if has_source else 0,
+            }))
+        return results
+
+    # Use ThreadPoolExecutor for concurrent document preparation
+    with ThreadPoolExecutor() as executor:
+        futures = [executor.submit(process_node, node) for node in nodes]
+        for future in as_completed(futures):
+            node_results = future.result()
+            for id_, doc, meta in node_results:
+                ids.append(id_)
+                docs.append(doc)
+                metadatas.append(meta)
 
     return ids, docs, metadatas
 
@@ -271,11 +352,32 @@ def index_callgraph(
 
     print(f"Embedding {len(ids)} document(s) in {index_mode} mode with model: {model_name}")
 
+
+    def embed_batch(batch_docs):
+        return model.encode(batch_docs, normalize_embeddings=True).tolist()
+
     for i in range(0, len(ids), batch_size):
         batch_ids = ids[i : i + batch_size]
         batch_docs = docs[i : i + batch_size]
         batch_meta = metadatas[i : i + batch_size]
 
+        # Use ThreadPoolExecutor to parallelize embedding if batch_size > 1
+        # (sentence-transformers is already fast, but this can help for very large batches)
+        # We'll split the batch into chunks and embed in parallel
+        chunk_size = max(1, len(batch_docs) // 4)
+        chunks = [batch_docs[j:j+chunk_size] for j in range(0, len(batch_docs), chunk_size)]
+        embeddings = []
+        with ThreadPoolExecutor() as executor:
+            futures = [executor.submit(embed_batch, chunk) for chunk in chunks]
+            for future in as_completed(futures):
+                embeddings.extend(future.result())
+
+        # Ensure embeddings are in the same order as batch_docs
+        # (as_completed does not guarantee order)
+        # So, instead, use map to preserve order
+        #embeddings = list(itertools.chain.from_iterable(executor.map(embed_batch, chunks)))
+
+        # If the above is not needed, just use the original order:
         embeddings = model.encode(batch_docs, normalize_embeddings=True).tolist()
 
         collection.upsert(

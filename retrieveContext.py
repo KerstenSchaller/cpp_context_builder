@@ -2,7 +2,7 @@
 Retrieve C++ callgraph context from Chroma DB for GitHub Copilot usage.
 
 Usage:
-  python copilot_retrieve.py --query "aquifer draining" --top-k 5
+  python3 retrieveContext.py --query "aquifer draining" --top-k 5
 """
 
 import argparse
@@ -11,7 +11,7 @@ import chromadb
 from sentence_transformers import SentenceTransformer
 
 DEFAULT_DB_DIR = "./chroma_db"
-DEFAULT_COLLECTION = "cpp_callgraph_hybrid"
+DEFAULT_COLLECTION = "cpp_callgraph"
 DEFAULT_EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
 
