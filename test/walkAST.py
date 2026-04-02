@@ -1,9 +1,28 @@
+
+import argparse
+import json
+import os
+import shlex
 from clang.cindex import *
 import clang
 Config.set_library_file("/usr/lib/llvm-14/lib/libclang.so")
 
-index = Index.create()
-tu = index.parse("test.cpp")
+filter_strings = [
+		'depends',
+        'usr/include',
+        'include/c++',
+        '_deps',
+        'x86_64-linux-gnu',
+        'fmt-src',
+        'stdio.h'
+]
+
+number_of_files_parsed = 0
+number_of_files_errors = 0
+number_of_classes = 0
+number_of_structs = 0
+number_of_enums = 0
+number_of_functions = 0
 
 # Cursor kinds that introduce a function/method *definition* we want to track.
 DEFINITION_KINDS = {
@@ -24,6 +43,10 @@ def getCursorKey(cursor):
     if cursor.location.file:
         return f"{cursor.location.file}:{cursor.location.line}:{cursor.spelling}"
     return cursor.spelling
+
+def logToFile(message, path = "AST_ERROR.log"):
+    with open(path, "a") as log_file:
+        log_file.write(message + "\n")
 
 def getSource(cursor):
     """Get the source code for a cursor"""
@@ -69,8 +92,10 @@ def getMethods(cursor):
 
 def parseClass(cursor):
     """Parse a class/struct declaration and print its fields"""
+    global number_of_classes, number_of_structs
+    number_of_classes += 1 if cursor.kind == CursorKind.CLASS_DECL else 0
+    number_of_structs += 1 if cursor.kind == CursorKind.STRUCT_DECL else 0
     typeStr = cursor.kind is CursorKind.CLASS_DECL and "class" or "struct"
-    print(f"typeStr {typeStr}")
     return {
         "type": typeStr,
         "comment": "Implementation info of a {}".format(typeStr),
@@ -84,6 +109,8 @@ def parseClass(cursor):
 
 def parseEnum(cursor):
     """Parse an enum declaration and return its info as a dict."""
+    global number_of_enums
+    number_of_enums += 1
     enum_constants = []
     for child in cursor.get_children():
         if child.kind == CursorKind.ENUM_CONSTANT_DECL:
@@ -141,6 +168,8 @@ def getFunctionCalls(cursor):
 
 def parseFunction(cursor):
     """Parse a function/method declaration and return its info as a dict."""
+    global number_of_functions
+    number_of_functions += 1
     return {
         "type": "function",
         "comment": "Implementation info of a function",
@@ -171,35 +200,186 @@ def printDictRecursively(d, indent=0):
 
 def handle_class(cursor):
     classInfo = parseClass(cursor)
-    printDictRecursively(classInfo)
+    #printDictRecursively(classInfo)
     
 def handle_enum(cursor):
     enumInfo = parseEnum(cursor)
-    printDictRecursively(enumInfo)
+    #printDictRecursively(enumInfo)
 
 def handle_function(cursor):
     functionInfo = parseFunction(cursor)
-    printDictRecursively(functionInfo)
+    #printDictRecursively(functionInfo)
 
 
 
+def isLocationFiltered(cursor):
+    if cursor.location.file:
+        for filter_str in filter_strings:
+            if filter_str in cursor.location.file.name:
+                return True
+    return False
 
+def walk_ast( cursor):
 
-def walk_ast(cursor):
+    # Use a static attribute to persist across recursive calls
+    if not hasattr(walk_ast, "parsed_keys"):
+        walk_ast.parsed_keys = set()
+
     for child in cursor.get_children():
+        key = getCursorKey(child)
+        if key in walk_ast.parsed_keys:
+            continue
+        walk_ast.parsed_keys.add(key)
+        if isLocationFiltered(child):
+            continue
         if child.kind in CLASS_KINDS:
             handle_class(child)
         elif child.kind in ENUM_KINDS:
             handle_enum(child)
         elif child.kind in DEFINITION_KINDS:
             handle_function(child)
-        
         walk_ast(child)
 
-# === Parse a C/C++ file ===
-index = Index.create()
-tu = index.parse("test.cpp")  # Replace with your file
 
-# Start walking from the translation unit root
-walk_ast(tu.cursor)
 
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Walk C++ AST with Clang Python bindings.")
+    parser.add_argument('-c', '--compile-commands', type=str, help='Path to compile_commands.json')
+    parser.add_argument('-tf', '--testFile', type=str, help='C++ source file to parse if not using compile_commands.json')
+    return parser.parse_args()
+
+def get_sources_from_compile_commands(path):
+    with open(path, 'r') as f:
+        data = json.load(f)
+    sources = [entry['file'] for entry in data if os.path.isfile(entry['file'])]
+    return sources
+
+def filter_source(source):
+    # return true if any of the filter strings are in the source path
+    for str in filter_strings:
+        if str in source:
+            return True
+    return False
+
+
+
+
+def clean_args(args, source_file=None, directory=None):
+    filtered = []
+    SKIP_WITH_VALUE = {"-o", "-MF", "-MT", "-MQ", "-MJ"}
+    SKIP_PREFIXES   = ["-Wl,", "-Winvalid", "-Werror", "-O"]
+    SKIP_EXACT      = {"-c"}
+    source_file_abs = os.path.abspath(source_file) if source_file else None
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg in SKIP_WITH_VALUE:
+            i += 2
+            continue
+        if arg in SKIP_EXACT or any(arg.startswith(p) for p in SKIP_PREFIXES):
+            i += 1
+            continue
+        candidate = arg
+        if not os.path.isabs(candidate) and directory:
+            candidate = os.path.join(directory, candidate)
+        if source_file_abs and os.path.abspath(candidate) == source_file_abs:
+            i += 1
+            continue
+        filtered.append(arg)
+        i += 1
+    return filtered
+
+def get_compile_args(file_path, db_path):
+    if db_path is None:
+        return ["-std=c++17"]
+    with open(db_path) as f:
+        db = json.load(f)
+
+    input_path = os.path.abspath(file_path)
+    for entry in db:
+        if os.path.abspath(entry["file"]) == input_path:
+            entry_dir = entry.get("directory")
+            parts = entry["arguments"] if entry.get("arguments") else shlex.split(entry["command"])
+            args = clean_args(parts[1:], source_file=input_path, directory=entry_dir)
+            return args
+    return ["-std=c++17"]
+
+def parseFiles(file_path, compile_args):
+    global number_of_files_parsed
+    if filter_source(file_path):
+        return
+    print(f"##### Parsing file: {file_path} #####")
+    _index = Index.create()
+
+    file_path = os.path.abspath(file_path)
+
+    extra = ["-fparse-all-comments", "-xc++"] 
+    args = compile_args + extra
+    try:
+        tu = _index.parse(
+            file_path,
+            args=args,
+            options=TranslationUnit.PARSE_INCOMPLETE,
+        )
+        walk_ast(tu.cursor)
+        number_of_files_parsed += 1
+    except Exception as e:
+        print(f"   Parse failed ({e}), retrying with minimal args…")
+        tu = _index.parse(
+            file_path,
+            args=["-std=c++20", "-xc++"],
+            options=TranslationUnit.PARSE_INCOMPLETE,
+        )
+        walk_ast(tu.cursor)
+        number_of_files_parsed += 1
+
+    fatal = [d for d in tu.diagnostics if d.severity >= 3]
+    if fatal:
+        print(f"  ⚠️  {len(fatal)} fatal diagnostic(s) in {os.path.basename(file_path)}")
+        print("    " + "\n    ".join(str(d) for d in fatal))
+        logToFile(f"Fatal diagnostics in {file_path}:\n" + "\n".join(str(d) for d in fatal))
+        global number_of_files_errors
+        number_of_files_errors += 1
+
+def main():
+
+    import time
+    start_time = time.time()
+
+    # Reset parsed_keys before each run
+    if hasattr(walk_ast, "parsed_keys"):
+        walk_ast.parsed_keys.clear()
+
+    args = parse_args()
+    # Consistency checks
+    if args.compile_commands and args.testFile:
+        print("Error: --compile-commands (-c) cannot be used together with --testFile (-tf).", flush=True)
+        exit(1)
+    if args.compile_commands is None and args.testFile is None:
+        print("Error: Either --compile-commands (-c) or --testFile (-tf) must be provided.", flush=True)
+        exit(1)
+
+    # get sources to parse (testfile or compile_commands.json)
+    if args.testFile:
+        sources = [args.testFile]
+        compile_args = get_compile_args(sources[0],args.compile_commands)
+        parseFiles(sources[0], compile_args)
+    elif args.compile_commands:
+        sources = get_sources_from_compile_commands(args.compile_commands)
+        for src in sources:
+            compile_args = get_compile_args(src,args.compile_commands)
+            parseFiles(src, compile_args)
+
+    end_time = time.time()
+    print(f"Parsed {number_of_files_parsed} files")
+    print(f"   Execution time: {end_time - start_time:.3f} seconds")
+    print(f"   Execution time: {(end_time - start_time)/60:.3f} minutes")
+    print(f"   Found {number_of_classes} classes")
+    print(f"   Found {number_of_structs} structs")
+    print(f"   Found {number_of_enums} enums")
+    print(f"   Found {number_of_functions} functions")
+
+# Only run main if this script is executed directly
+if __name__ == "__main__":
+    main()
