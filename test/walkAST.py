@@ -24,6 +24,8 @@ number_of_structs = 0
 number_of_enums = 0
 number_of_functions = 0
 
+unique_function_calls = set()
+
 # Cursor kinds that introduce a function/method *definition* we want to track.
 DEFINITION_KINDS = {
     CursorKind.FUNCTION_DECL,
@@ -182,6 +184,13 @@ def filterFunctionCalls(calls):
 
     return [call for call in unique_calls if not any(f in call for f in functionFilterString)]
 
+def warnNumberOfFunctionCalls(calls, function_name, threshold=10):
+    """Print a warning if the number of function calls exceeds a threshold."""
+    if len(calls) > threshold:
+        logToFile(f"⚠️  Warning: Function '{function_name}' has {len(calls)} calls, which may indicate a parsing issue.", "AST_WARNINGS.log")
+        for call in calls:
+            logToFile(f"   - {call}", "AST_WARNINGS.log")
+
 def getFunctionCalls(cursor):
     """Get the function calls made within a function/method cursor."""
     calls = []
@@ -200,6 +209,8 @@ def getFunctionCalls(cursor):
         calls.extend(getFunctionCalls(child))  # Recurse into children
     # make calls unique
     calls = filterFunctionCalls(calls)
+    warnNumberOfFunctionCalls(calls, cursor.spelling)
+    unique_function_calls.update(calls)
     return calls
 
 def parseFunction(cursor):
@@ -289,7 +300,6 @@ def print_ast(cursor, indent="", last=True, canonical = False):
         print_ast(child, indent + ("   " if last else "│  "), is_last, canonical)  
 
 def walk_ast( cursor):
-
     # Use a static attribute to persist across recursive calls
     if not hasattr(walk_ast, "parsed_keys"):
         walk_ast.parsed_keys = set()
@@ -415,7 +425,7 @@ def parseFiles(file_path, compile_args):
             if fatal:
                 print(f"  ⚠️  {len(fatal)} fatal diagnostic(s) in {os.path.basename(file_path)}")
                 print("    " + "\n    ".join(str(d) for d in fatal))
-                logToFile(f"Fatal diagnostics in {file_path}:\n" + "\n".join(str(d) for d in fatal))
+                logToFile(f"Fatal diagnostics in {file_path}:\n" + "\n".join(str(d) for d in fatal), "AST_ERRORS.log")
                 global number_of_files_errors
                 number_of_files_errors += 1
 
@@ -468,6 +478,11 @@ def main():
     print(f"   Found {number_of_structs} structs")
     print(f"   Found {number_of_enums} enums")
     print(f"   Found {number_of_functions} functions")
+
+    #print unique function calls to file
+    with open("unique_function_calls.log", "w") as f:
+        for call in sorted(unique_function_calls):
+            f.write(call + "\n")
 
 # Only run main if this script is executed directly
 if __name__ == "__main__":
