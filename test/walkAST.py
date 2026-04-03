@@ -20,9 +20,11 @@ filter_strings = [
 number_of_files_parsed = 0
 number_of_files_errors = 0
 number_of_classes = 0
+number_of_class_templates = 0
 number_of_structs = 0
 number_of_enums = 0
 number_of_functions = 0
+number_of_function_templates = 0
 
 unique_function_calls = set()
 
@@ -37,7 +39,7 @@ DEFINITION_KINDS = {
 }
 
 # Kinds for classes, structs, enums
-CLASS_KINDS = {CursorKind.CLASS_DECL, CursorKind.STRUCT_DECL}
+CLASS_KINDS = {CursorKind.CLASS_DECL, CursorKind.STRUCT_DECL, CursorKind.CLASS_TEMPLATE}
 ENUM_KINDS = {CursorKind.ENUM_DECL}
 
 def getCursorKey(cursor):
@@ -56,19 +58,7 @@ def _kind_safe(cursor):
     except ValueError:
         return None
 
-def qualified_name(cursor):
-    """Return a fully-qualified name like Namespace::Class::method(args)."""
-    parts = []
-    c = cursor
-    while c and c.kind not in (CursorKind.TRANSLATION_UNIT,):
-        spelling = c.displayname or c.spelling
-        if spelling:
-            parts.append(spelling)
-        c = c.semantic_parent
-        if c is None or _kind_safe(c) is None:
-            break
-    parts.reverse()
-    return "::".join(parts) if parts else cursor.displayname
+
 
 def getSource(cursor):
     """Get the source code for a cursor"""
@@ -100,6 +90,25 @@ def getNamespaces(cursor):
         parent = parent.semantic_parent
     return '::'.join(reversed(namespaces))
 
+def getClassName(cursor):
+    """Get the namespaces of a cursor"""
+    className = ""
+    parent = cursor.semantic_parent
+    while parent and parent.kind != CursorKind.TRANSLATION_UNIT:
+        if parent.kind == CursorKind.CLASS_DECL or parent.kind == CursorKind.STRUCT_DECL or parent.kind == CursorKind.CLASS_TEMPLATE:
+            className = parent.spelling
+            return className
+        parent = parent.semantic_parent
+    return ""
+
+def qualified_name(cursor):
+    """Return a fully-qualified name like Namespace::Class::method(args)."""
+    """ Use getNamespaces to get the namespaces, then append the cursor's own spelling. """
+    className = getClassName(cursor)
+    namespaces = getNamespaces(cursor)
+    if className:
+        return f"{namespaces}::{className}::{cursor.spelling}" if namespaces else f"{className}::{cursor.spelling}"
+    return f"{namespaces}::{cursor.spelling}" if namespaces else cursor.spelling
 
 
 def getMethods(cursor):
@@ -114,11 +123,13 @@ def getMethods(cursor):
 
 def parseClass(cursor):
     """Parse a class/struct declaration and print its fields"""
-    global number_of_classes, number_of_structs
+    global number_of_classes, number_of_structs, number_of_class_templates
     number_of_classes += 1 if cursor.kind == CursorKind.CLASS_DECL else 0
     number_of_structs += 1 if cursor.kind == CursorKind.STRUCT_DECL else 0
-    typeStr = cursor.kind is CursorKind.CLASS_DECL and "class" or "struct"
-    return {
+    number_of_class_templates += 1 if cursor.kind == CursorKind.CLASS_TEMPLATE else 0
+    typeStr = cursor.kind is CursorKind.CLASS_DECL and "class" or cursor.kind is CursorKind.STRUCT_DECL and "struct" or "class template"
+
+    retVal = {
         "type": typeStr,
         "symbol": qualified_name(cursor),
         "comment": "Implementation details of a {}".format(typeStr),
@@ -129,6 +140,10 @@ def parseClass(cursor):
         "methods": getMethods(cursor),
         "source": getSource(cursor)
     }
+
+    addTemplateParameters(cursor, retVal)
+
+    return retVal
 
 def parseEnum(cursor):
     """Parse an enum declaration and return its info as a dict."""
@@ -149,26 +164,6 @@ def parseEnum(cursor):
         "source": getSource(cursor)
     }
 
-def getFunctionCallNamespaces(cursor, isConstructorCall):
-    """Get the namespaces of a function call cursor"""
-    # regular functions
-    recurse = (lambda self, cur: sum([
-        [child.spelling] if child.kind == CursorKind.NAMESPACE_REF else self(self, child)
-        for child in cur.get_children()
-    ], []))
-    namespaces = recurse(recurse, cursor)
-    # class member functions have a child MEMBER_REF_EXPR which has a child DECL_REF_EXPR
-    if namespaces == []:
-        for child in cursor.get_children():
-            if child.kind == CursorKind.MEMBER_REF_EXPR:
-                for grandchild in child.get_children():
-                    if grandchild.kind == CursorKind.DECL_REF_EXPR:
-                        namespaces.append(grandchild.type.spelling)
-    # constructor calls are TYPE_REF followed by CALL_EXPR
-    if namespaces == []:
-        if isConstructorCall:
-            namespaces.append(cursor.type.spelling)
-    return '::'.join(reversed(namespaces))    
 
 def filterFunctionCalls(calls):
     """Filter function calls to remove duplicates and sort them."""
@@ -198,29 +193,54 @@ def getFunctionCalls(cursor):
     for i in range(len(children)):
         child = children[i]
         if child.kind == CursorKind.CALL_EXPR:
-            called_func = child.displayname.split('(')[0]  # Get function name without arguments
-            if children[i - 1].kind == CursorKind.TYPE_REF:
-                namespaces = getFunctionCallNamespaces(child, True)
-            else:
-                namespaces = getFunctionCallNamespaces(child, False)
-            if namespaces != "":
-                called_func = f"{namespaces}::{called_func}"
-            calls.append(called_func)
-        calls.extend(getFunctionCalls(child))  # Recurse into children
+            functionCursor = child.referenced
+            if functionCursor and functionCursor.spelling:
+                calls.append(f"{qualified_name(functionCursor)}" )
+        calls.extend(getFunctionCalls(child)) 
+
     # make calls unique
     calls = filterFunctionCalls(calls)
     warnNumberOfFunctionCalls(calls, cursor.spelling)
     unique_function_calls.update(calls)
     return calls
 
+def addTemplateParameters(cursor, retval):
+    if cursor.kind == CursorKind.FUNCTION_TEMPLATE:
+        print(f"Found function template: {cursor.spelling} at {cursor.location.file}:{cursor.location.line}")
+    if cursor.kind == CursorKind.CLASS_TEMPLATE:
+        print(f"Found class template: {cursor.spelling} at {cursor.location.file}:{cursor.location.line}")
+    
+
+    if cursor.kind == CursorKind.FUNCTION_TEMPLATE or cursor.kind == CursorKind.CLASS_TEMPLATE:
+        template_params = []
+        for child in cursor.get_children():
+            print(f"   Template child: {child.kind} {child.spelling}")
+            if child.kind == CursorKind.TEMPLATE_TYPE_PARAMETER:
+                print(f"   Found template type parameter: {child.spelling} {child.location.file}:{child.location.line}")
+                template_params.append(f"typename {child.spelling}")
+            elif child.kind == CursorKind.TEMPLATE_NON_TYPE_PARAMETER:
+                template_params.append(f"{child.type.spelling} {child.spelling}")
+            elif child.kind == CursorKind.TEMPLATE_TEMPLATE_PARAMETER:
+                template_params.append(f"template <...> class {child.spelling}")
+        if template_params:
+            print(f"   Template parameters for function template {cursor.spelling}: {template_params}")
+            retval["template_parameters"] = template_params
+        else:
+            print(f"   No template parameters found for function template {cursor.spelling}")
+
 def parseFunction(cursor):
     """Parse a function/method declaration and return its info as a dict."""
-    global number_of_functions
-    number_of_functions += 1
-    return {
-        "type": "function",
+    global number_of_functions, number_of_function_templates
+    typeStr = cursor.kind == CursorKind.FUNCTION_TEMPLATE and "function template" or "function"
+    number_of_functions += 1 if cursor.kind in {CursorKind.FUNCTION_DECL, CursorKind.CXX_METHOD, CursorKind.CONSTRUCTOR, CursorKind.DESTRUCTOR} else 0
+    number_of_function_templates += 1 if cursor.kind == CursorKind.FUNCTION_TEMPLATE else 0
+
+
+
+    retval = {
+        "type": typeStr,
         "symbol": qualified_name(cursor),
-        "comment": "Implementation details of a function",
+        "comment": "Implementation details of a " + typeStr,
         "location": f"{cursor.location.file}:{cursor.location.line}" if cursor.location.file else "unknown",
         "namespaces": getNamespaces(cursor),
         "name": cursor.spelling,
@@ -229,6 +249,9 @@ def parseFunction(cursor):
         "calls": getFunctionCalls(cursor),
         "source": getSource(cursor)
     }
+
+    addTemplateParameters(cursor, retval)
+    return retval
 
 def printDictRecursively(d, indent=0):
     """Helper function to print a dictionary recursively with indentation."""
@@ -478,6 +501,9 @@ def main():
     print(f"   Found {number_of_structs} structs")
     print(f"   Found {number_of_enums} enums")
     print(f"   Found {number_of_functions} functions")
+    print(f"   Found {number_of_class_templates} class templates")
+    print(f"   Found {number_of_function_templates} function templates")
+    print(f"   Found {number_of_files_errors} files with fatal errors")
 
     #print unique function calls to file
     with open("unique_function_calls.log", "w") as f:
