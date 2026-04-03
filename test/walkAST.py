@@ -48,6 +48,26 @@ def logToFile(message, path = "AST_ERROR.log"):
     with open(path, "a") as log_file:
         log_file.write(message + "\n")
 
+def _kind_safe(cursor):
+    try:
+        return cursor.kind
+    except ValueError:
+        return None
+
+def qualified_name(cursor):
+    """Return a fully-qualified name like Namespace::Class::method(args)."""
+    parts = []
+    c = cursor
+    while c and c.kind not in (CursorKind.TRANSLATION_UNIT,):
+        spelling = c.displayname or c.spelling
+        if spelling:
+            parts.append(spelling)
+        c = c.semantic_parent
+        if c is None or _kind_safe(c) is None:
+            break
+    parts.reverse()
+    return "::".join(parts) if parts else cursor.displayname
+
 def getSource(cursor):
     """Get the source code for a cursor"""
     if cursor.location.file:
@@ -98,7 +118,8 @@ def parseClass(cursor):
     typeStr = cursor.kind is CursorKind.CLASS_DECL and "class" or "struct"
     return {
         "type": typeStr,
-        "comment": "Implementation info of a {}".format(typeStr),
+        "symbol": qualified_name(cursor),
+        "comment": "Implementation details of a {}".format(typeStr),
         "location": f"{cursor.location.file}:{cursor.location.line}" if cursor.location.file else "unknown",
         "namespaces": getNamespaces(cursor),
         "name": cursor.spelling,
@@ -117,7 +138,8 @@ def parseEnum(cursor):
             enum_constants.append(child.spelling + (f" = {child.enum_value}" if child.enum_value is not None else ""))
     return {
         "type": "enum",
-        "comment": "Implementation info of an enum",
+        "symbol": qualified_name(cursor),
+        "comment": "Implementation details of an enum",
         "location": f"{cursor.location.file}:{cursor.location.line}" if cursor.location.file else "unknown",
         "namespaces": getNamespaces(cursor),
         "name": cursor.spelling,
@@ -146,7 +168,19 @@ def getFunctionCallNamespaces(cursor, isConstructorCall):
             namespaces.append(cursor.type.spelling)
     return '::'.join(reversed(namespaces))    
 
+def filterFunctionCalls(calls):
+    """Filter function calls to remove duplicates and sort them."""
+    unique_calls = list(set(calls))
+    unique_calls.sort()
+    functionFilterString = ["operator",
+                            "std::", 
+                            "fmt::", 
+                            "spdlog::", 
+                            "boost::", 
+                            "catch::",
+                            "memset"]
 
+    return [call for call in unique_calls if not any(f in call for f in functionFilterString)]
 
 def getFunctionCalls(cursor):
     """Get the function calls made within a function/method cursor."""
@@ -164,6 +198,8 @@ def getFunctionCalls(cursor):
                 called_func = f"{namespaces}::{called_func}"
             calls.append(called_func)
         calls.extend(getFunctionCalls(child))  # Recurse into children
+    # make calls unique
+    calls = filterFunctionCalls(calls)
     return calls
 
 def parseFunction(cursor):
@@ -172,7 +208,8 @@ def parseFunction(cursor):
     number_of_functions += 1
     return {
         "type": "function",
-        "comment": "Implementation info of a function",
+        "symbol": qualified_name(cursor),
+        "comment": "Implementation details of a function",
         "location": f"{cursor.location.file}:{cursor.location.line}" if cursor.location.file else "unknown",
         "namespaces": getNamespaces(cursor),
         "name": cursor.spelling,
@@ -200,15 +237,15 @@ def printDictRecursively(d, indent=0):
 
 def handle_class(cursor):
     classInfo = parseClass(cursor)
-    #printDictRecursively(classInfo)
+    printDictRecursively(classInfo)
     
 def handle_enum(cursor):
     enumInfo = parseEnum(cursor)
-    #printDictRecursively(enumInfo)
+    printDictRecursively(enumInfo)
 
 def handle_function(cursor):
     functionInfo = parseFunction(cursor)
-    #printDictRecursively(functionInfo)
+    printDictRecursively(functionInfo)
 
 
 
@@ -218,6 +255,38 @@ def isLocationFiltered(cursor):
             if filter_str in cursor.location.file.name:
                 return True
     return False
+
+def print_ast(cursor, indent="", last=True, canonical = False):
+    """Prints the AST with tree structure and useful info."""
+    if not hasattr(print_ast, "parsed_keys"):
+        print_ast.parsed_keys = set()
+
+    if canonical:
+        cursor = cursor.canonical
+    marker = "└─ " if last else "├─ "
+    node_info = f"{cursor.is_definition() and 'Def ' or 'Decl '}{cursor.kind.name} {cursor.spelling}"
+    if cursor.type.kind != clang.cindex.TypeKind.INVALID:
+        node_info += f" : {cursor.type.spelling}"
+    if cursor.location.file:
+        node_info += f" ({cursor.location.file}:{cursor.location.line})"
+    
+    IGNORE_KINDS = {
+        CursorKind.COMPOUND_STMT,
+    }
+
+    if cursor.kind not in IGNORE_KINDS:
+        print(indent + marker + node_info)
+    
+    children = list(cursor.get_children())
+    for i, child in enumerate(children):
+        key = getCursorKey(child)
+        if key in print_ast.parsed_keys:
+            continue
+        print_ast.parsed_keys.add(key)
+        if isLocationFiltered(child):
+            continue
+        is_last = i == len(children) - 1
+        print_ast(child, indent + ("   " if last else "│  "), is_last, canonical)  
 
 def walk_ast( cursor):
 
@@ -247,6 +316,8 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Walk C++ AST with Clang Python bindings.")
     parser.add_argument('-c', '--compile-commands', type=str, help='Path to compile_commands.json')
     parser.add_argument('-tf', '--testFile', type=str, help='C++ source file to parse if not using compile_commands.json')
+    parser.add_argument('-sf', '--specFile', type=str, help='If set, only parse this file from compile_commands.json')
+    parser.add_argument('-pa', '--printAST', action='store_true', help='If set, print the AST using print_ast instead of walk_ast')
     return parser.parse_args()
 
 def get_sources_from_compile_commands(path):
@@ -322,7 +393,10 @@ def parseFiles(file_path, compile_args):
             args=args,
             options=TranslationUnit.PARSE_INCOMPLETE,
         )
-        walk_ast(tu.cursor)
+        if getattr(parseFiles, 'print_ast_mode', False):
+            print_ast(tu.cursor)
+        else:
+            walk_ast(tu.cursor)
         number_of_files_parsed += 1
     except Exception as e:
         print(f"   Parse failed ({e}), retrying with minimal args…")
@@ -331,16 +405,19 @@ def parseFiles(file_path, compile_args):
             args=["-std=c++20", "-xc++"],
             options=TranslationUnit.PARSE_INCOMPLETE,
         )
-        walk_ast(tu.cursor)
-        number_of_files_parsed += 1
+        if getattr(parseFiles, 'print_ast_mode', False):
+            print_ast(tu.cursor)
+        else:
+            walk_ast(tu.cursor)
+            number_of_files_parsed += 1
 
-    fatal = [d for d in tu.diagnostics if d.severity >= 3]
-    if fatal:
-        print(f"  ⚠️  {len(fatal)} fatal diagnostic(s) in {os.path.basename(file_path)}")
-        print("    " + "\n    ".join(str(d) for d in fatal))
-        logToFile(f"Fatal diagnostics in {file_path}:\n" + "\n".join(str(d) for d in fatal))
-        global number_of_files_errors
-        number_of_files_errors += 1
+            fatal = [d for d in tu.diagnostics if d.severity >= 3]
+            if fatal:
+                print(f"  ⚠️  {len(fatal)} fatal diagnostic(s) in {os.path.basename(file_path)}")
+                print("    " + "\n    ".join(str(d) for d in fatal))
+                logToFile(f"Fatal diagnostics in {file_path}:\n" + "\n".join(str(d) for d in fatal))
+                global number_of_files_errors
+                number_of_files_errors += 1
 
 def main():
 
@@ -353,12 +430,19 @@ def main():
 
     args = parse_args()
     # Consistency checks
-    if args.compile_commands and args.testFile:
-        print("Error: --compile-commands (-c) cannot be used together with --testFile (-tf).", flush=True)
+    if args.compile_commands and not os.path.isfile(args.compile_commands):
         exit(1)
     if args.compile_commands is None and args.testFile is None:
         print("Error: Either --compile-commands (-c) or --testFile (-tf) must be provided.", flush=True)
         exit(1)
+    if args.specFile and not args.compile_commands:
+        print("Error: --specFile (-sf) can only be used with --compile-commands (-c).", flush=True)
+        exit(1)
+
+
+    # Set print_ast_mode flag for parseFiles
+    parseFiles.print_ast_mode = getattr(args, 'printAST', False)
+
 
     # get sources to parse (testfile or compile_commands.json)
     if args.testFile:
@@ -367,6 +451,11 @@ def main():
         parseFiles(sources[0], compile_args)
     elif args.compile_commands:
         sources = get_sources_from_compile_commands(args.compile_commands)
+        if args.specFile:
+            # Only parse the specified file if present in sources
+            spec_abs = os.path.abspath(args.specFile)
+            print(f"Filtering sources to only include: {spec_abs}")
+            sources = [src for src in sources if args.specFile in os.path.abspath(src) ]
         for src in sources:
             compile_args = get_compile_args(src,args.compile_commands)
             parseFiles(src, compile_args)
